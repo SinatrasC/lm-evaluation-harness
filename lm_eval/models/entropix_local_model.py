@@ -77,6 +77,10 @@ class EntropixLocalChatModel(TemplateAPI):
     def _parse_messages(self, messages) -> List[Dict]:
         """Parse messages from various input formats into the expected format"""
         try:
+            # Handle tuples by converting to list
+            if isinstance(messages, tuple):
+                messages = list(messages)
+
             # Handle JsonChatStr objects which have a prompt attribute containing a string
             if hasattr(messages, 'prompt'):
                 try:
