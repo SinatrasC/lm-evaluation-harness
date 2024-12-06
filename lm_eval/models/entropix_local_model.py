@@ -174,11 +174,26 @@ class EntropixLocalChatModel(TemplateAPI):
         except RequestException as e:
             raise ValueError(f"Error contacting local model: {e}")
 
-    def model_call(self, payload):
+    def model_call(self, **kwargs):
         """
-        Override model_call to handle streaming response.
-        We'll return a dictionary similar to OpenAI's final JSON (no streaming).
+        Handle calls from lm_eval that provide `messages` and `gen_kwargs`, etc.
+        We accept **kwargs and then extract what we need.
         """
+        messages = kwargs.pop("messages", None)
+        gen_kwargs = kwargs.pop("gen_kwargs", {})
+    
+        # If for some reason messages are not passed in, raise an error
+        if messages is None:
+            raise ValueError("No messages provided to model_call")
+    
+        # Create the payload using _create_payload
+        payload = self._create_payload(
+            messages=messages,
+            generate=True,
+            gen_kwargs=gen_kwargs,
+        )
+    
+        # Stream completion from the local model server
         return self._stream_completion(payload)
 
     @staticmethod
