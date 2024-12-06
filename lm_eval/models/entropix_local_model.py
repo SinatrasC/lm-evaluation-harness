@@ -74,6 +74,32 @@ class EntropixLocalChatModel(TemplateAPI):
         }
         return headers
 
+    def _parse_messages(self, messages) -> List[Dict]:
+        """Parse messages from various input formats into the expected format"""
+        try:
+            # Handle JsonChatStr objects which have a prompt attribute containing a string
+            if hasattr(messages, 'prompt'):
+                try:
+                    # Try to parse the prompt as a JSON string
+                    return json.loads(messages.prompt)
+                except json.JSONDecodeError:
+                    # If not valid JSON, treat it as a single user message
+                    return [{"role": "user", "content": messages.prompt}]
+
+            # Handle direct list/dict input
+            if isinstance(messages, list):
+                return messages
+            if isinstance(messages, dict):
+                return [messages]
+            
+            # Handle string input by treating it as user message
+            if isinstance(messages, str):
+                return [{"role": "user", "content": messages}]
+            
+            raise ValueError(f"Unsupported message format: {type(messages)}")
+        except Exception as e:
+            raise ValueError(f"Failed to parse messages: {e}") from e
+
     def _create_payload(
         self,
         messages: List[Dict],
@@ -89,17 +115,19 @@ class EntropixLocalChatModel(TemplateAPI):
         """
         gen_kwargs = gen_kwargs or {}
         
-        # Validate and format messages
-        formatted_messages = []
-        for msg in messages:
+        # Parse and validate messages
+        try:
+            formatted_messages = self._parse_messages(messages)
+        except Exception as e:
+            raise ValueError(f"Failed to parse messages: {e}")
+
+        # Validate each message
+        for msg in formatted_messages:
             if not isinstance(msg, dict) or 'role' not in msg or 'content' not in msg:
-                raise ValueError(f"Invalid message format: {msg}")
+                raise ValueError(f"Invalid message format after parsing: {msg}")
             if msg['role'] not in ['system', 'user', 'assistant']:
                 raise ValueError(f"Invalid role in message: {msg['role']}")
-            formatted_messages.append({
-                "role": msg['role'],
-                "content": str(msg['content'])
-            })
+            msg['content'] = str(msg['content'])
 
         # Handle max_tokens
         if "max_tokens" in gen_kwargs:
