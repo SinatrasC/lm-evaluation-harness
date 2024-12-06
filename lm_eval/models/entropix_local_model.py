@@ -31,10 +31,14 @@ class EntropixLocalChatModel(TemplateAPI):
         max_length=2048,
         max_gen_toks=2048,
         batch_size=1,
+        timeout=30,
+        verify_certificate=True,
         **kwargs,
     ):
-        # Store base_url before calling super().__init__
+        # Store attributes before calling super().__init__
         self._base_url = base_url
+        self._timeout = timeout
+        self._verify_certificate = verify_certificate
         
         super().__init__(
             base_url=base_url,
@@ -44,6 +48,8 @@ class EntropixLocalChatModel(TemplateAPI):
             max_length=max_length,
             max_gen_toks=max_gen_toks,
             batch_size=batch_size,
+            timeout=timeout,
+            verify_certificate=verify_certificate,
             **kwargs,
         )
         
