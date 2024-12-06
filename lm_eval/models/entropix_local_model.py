@@ -33,6 +33,9 @@ class EntropixLocalChatModel(TemplateAPI):
         batch_size=1,
         **kwargs,
     ):
+        # Store base_url before calling super().__init__
+        self._base_url = base_url
+        
         super().__init__(
             base_url=base_url,
             tokenizer_backend=tokenizer_backend,
@@ -43,6 +46,7 @@ class EntropixLocalChatModel(TemplateAPI):
             batch_size=batch_size,
             **kwargs,
         )
+        
         # Chat completions typically do not support batching or logprobs.
         if self._batch_size > 1:
             eval_logger.warning(
@@ -77,18 +81,10 @@ class EntropixLocalChatModel(TemplateAPI):
         Create the payload for the chat endpoint. We assume --apply_chat_template 
         has already formatted the `messages` as a list of dicts like:
         [{"role": "system", "content": ...}, {"role": "user", "content": ...}, ...]
-
-        Our local endpoint expects similar arguments as OpenAI:
-        {
-            "messages": messages,
-            "model": self.model,
-            "max_tokens": ...,
-            "temperature": ...,
-            "stop": [...]
-        }
         """
         gen_kwargs = gen_kwargs or {}
         gen_kwargs.pop("do_sample", False)
+        
         # max_tokens logic
         if "max_tokens" in gen_kwargs:
             max_tokens = gen_kwargs.pop("max_tokens")
@@ -105,7 +101,7 @@ class EntropixLocalChatModel(TemplateAPI):
             "model": self.model,
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "stop": stop[:4],
+            "stop": stop[:4],  # OpenAI API limit
         }
         # Add any remaining gen_kwargs to payload
         payload.update(gen_kwargs)
@@ -116,8 +112,6 @@ class EntropixLocalChatModel(TemplateAPI):
         Handle the streaming response from the local endpoint.
         The endpoint returns `text/event-stream`, with lines like:
         data: {"id":"...", "choices":[{"delta":{"content":"..."},"finish_reason":null}]}
-
-        We'll accumulate `content` until finish_reason=stop or the stream ends.
         """
         try:
             with requests.post(
@@ -131,24 +125,25 @@ class EntropixLocalChatModel(TemplateAPI):
                 response.raise_for_status()
                 full_response_text = ""
                 role_set = False
+                
                 for line in response.iter_lines(decode_unicode=True):
                     if not line or not line.startswith("data: "):
                         continue
+                        
                     data_str = line[len("data: "):].strip()
                     if data_str == "[DONE]":
                         break
+                        
                     try:
                         data = json.loads(data_str)
                     except json.JSONDecodeError:
-                        # Ignore malformed lines
                         continue
 
-                    # Each chunk can have multiple choices; we assume one choice.
+                    # Process choices in the response
                     if "choices" in data and data["choices"]:
                         for choice in data["choices"]:
                             delta = choice.get("delta", {})
                             if "role" in delta and not role_set:
-                                # The first delta often sets the role
                                 role_set = True
                             if "content" in delta:
                                 full_response_text += delta["content"]
@@ -161,7 +156,8 @@ class EntropixLocalChatModel(TemplateAPI):
                                         }
                                     }]
                                 }
-                # If we reach here, we got [DONE] or ended stream without a stop.
+                
+                # Return accumulated response if stream ends without explicit stop
                 return {
                     "choices": [{
                         "message": {
@@ -175,25 +171,19 @@ class EntropixLocalChatModel(TemplateAPI):
             raise ValueError(f"Error contacting local model: {e}")
 
     def model_call(self, **kwargs):
-        """
-        Handle calls from lm_eval that provide `messages` and `gen_kwargs`, etc.
-        We accept **kwargs and then extract what we need.
-        """
+        """Handle calls from lm_eval that provide `messages` and `gen_kwargs`"""
         messages = kwargs.pop("messages", None)
         gen_kwargs = kwargs.pop("gen_kwargs", {})
     
-        # If for some reason messages are not passed in, raise an error
         if messages is None:
             raise ValueError("No messages provided to model_call")
     
-        # Create the payload using _create_payload
         payload = self._create_payload(
             messages=messages,
             generate=True,
             gen_kwargs=gen_kwargs,
         )
     
-        # Stream completion from the local model server
         return self._stream_completion(payload)
 
     @staticmethod
@@ -203,19 +193,14 @@ class EntropixLocalChatModel(TemplateAPI):
         ctxlens: List[int] = None,
         **kwargs,
     ) -> List[Tuple[float, bool]]:
-        """
-        Chat completions do not provide token-level logprobs for prompts.
-        We raise NotImplementedError here.
-        """
+        """Chat completions do not support token-level logprobs"""
         raise NotImplementedError(
             "Loglikelihood is not supported for chat completions."
         )
 
     @staticmethod
     def parse_generations(outputs: Union[Dict, List[Dict]], **kwargs) -> List[str]:
-        """
-        Parse the generated assistant message from the final returned dict.
-        """
+        """Parse the generated assistant message from the final returned dict"""
         if not isinstance(outputs, list):
             outputs = [outputs]
         res = []
@@ -233,11 +218,11 @@ class EntropixLocalChatModel(TemplateAPI):
         add_special_tokens=None,
         **kwargs,
     ) -> Union[List[str], List[int], Any]:
-        # For chat models, we return the input as-is if needed.
-        # Typically, chat messages are passed as lists of dicts and not tokenized here.
+        """Return input as-is for chat models"""
         return string
 
     def loglikelihood(self, requests, **kwargs):
+        """Chat completions do not support loglikelihood computation"""
         raise NotImplementedError(
             "Loglikelihood is not supported for chat completions."
         )
