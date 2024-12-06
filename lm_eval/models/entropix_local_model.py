@@ -13,13 +13,7 @@ from lm_eval.utils import eval_logger
 class EntropixLocalChatModel(TemplateAPI):
     """
     A local model interface for a server that exposes an endpoint similar to 
-    OpenAI's chat completion streaming API, as defined in server_main.py.
-
-    This model:
-    - Uses the /v1/chat/completions endpoint.
-    - Expects a JSON body with `messages` and returns streamed responses.
-    - Requires `--apply_chat_template` when running lm-eval to ensure the 
-      requests are in a chat-compatible format.
+    OpenAI's chat completion streaming API.
     """
 
     def __init__(
@@ -53,111 +47,127 @@ class EntropixLocalChatModel(TemplateAPI):
             **kwargs,
         )
         
-        # Chat completions typically do not support batching or logprobs.
         if self._batch_size > 1:
             eval_logger.warning(
                 "Chat completions does not support batching. Defaulting to batch size 1."
             )
             self._batch_size = 1
 
-    @cached_property
-    def api_key(self):
-        # If your local model doesn't require a key, return an empty string.
-        # If it does, set an ENV variable and read it here.
-        return os.environ.get("API_KEYS", "sk-test-key")
+    def _extract_prompt(self, obj: Any) -> Optional[str]:
+        """Extract prompt from various types of objects"""
+        if hasattr(obj, 'prompt'):
+            return obj.prompt
+        elif isinstance(obj, (str, int, float)):
+            return str(obj)
+        elif isinstance(obj, (list, tuple)):
+            # For containers, try each element
+            for item in obj:
+                result = self._extract_prompt(item)
+                if result is not None:
+                    return result
+        return None
 
-    def headers(self) -> Dict[str, str]:
-        # Set headers if needed. The local model might not require any key.
-        # If you have an auth token, include it here.
-        headers = {
-            "Content-Type": "application/json",
-        }
-        return headers
-
-    def _parse_messages(self, messages) -> List[Dict]:
-        """Parse messages from various input formats into the expected format"""
+    def _parse_messages(self, messages: Any) -> List[Dict[str, str]]:
+        """
+        Parse messages from various input formats into the expected format.
+        Now handles nested structures and multiple JsonChatStr objects.
+        """
         try:
-            # Handle tuples by converting to list
-            if isinstance(messages, tuple):
-                messages = list(messages)
-
-            # Handle JsonChatStr objects which have a prompt attribute containing a string
-            if hasattr(messages, 'prompt'):
+            # Extract prompt if it exists at any level
+            prompt = self._extract_prompt(messages)
+            if prompt:
                 try:
-                    # Try to parse the prompt as a JSON string
-                    return json.loads(messages.prompt)
+                    # Try parsing as JSON first
+                    parsed = json.loads(prompt)
+                    if isinstance(parsed, list):
+                        return parsed
+                    elif isinstance(parsed, dict):
+                        return [parsed]
                 except json.JSONDecodeError:
-                    # If not valid JSON, treat it as a single user message
-                    return [{"role": "user", "content": messages.prompt}]
+                    # If not JSON, treat as user message
+                    return [{"role": "user", "content": prompt}]
 
-            # Handle direct list/dict input
-            if isinstance(messages, list):
+            # Handle direct containers
+            if isinstance(messages, (tuple, list)):
+                messages = list(messages)
+                if len(messages) == 1:
+                    return self._parse_messages(messages[0])
                 return messages
+
+            # Handle dictionaries
             if isinstance(messages, dict):
                 return [messages]
-            
-            # Handle string input by treating it as user message
+
+            # Handle strings
             if isinstance(messages, str):
-                return [{"role": "user", "content": messages}]
-            
-            raise ValueError(f"Unsupported message format: {type(messages)}")
+                try:
+                    parsed = json.loads(messages)
+                    if isinstance(parsed, list):
+                        return parsed
+                    elif isinstance(parsed, dict):
+                        return [parsed]
+                except json.JSONDecodeError:
+                    return [{"role": "user", "content": messages}]
+
+            raise ValueError(f"Unable to parse messages from: {type(messages)}")
         except Exception as e:
             raise ValueError(f"Failed to parse messages: {e}") from e
 
+    def _validate_message(self, msg: Dict) -> Dict[str, str]:
+        """Validate and format a single message"""
+        if not isinstance(msg, dict):
+            raise ValueError(f"Message must be a dictionary, got {type(msg)}")
+        
+        if 'role' not in msg or 'content' not in msg:
+            raise ValueError(f"Message missing required fields: {msg}")
+            
+        if msg['role'] not in ['system', 'user', 'assistant']:
+            raise ValueError(f"Invalid role: {msg['role']}")
+            
+        return {
+            "role": msg['role'],
+            "content": str(msg['content'])
+        }
+
     def _create_payload(
         self,
-        messages: List[Dict],
+        messages: Any,
         generate=False,
-        gen_kwargs: dict = None,
+        gen_kwargs: Optional[dict] = None,
         seed=1234,
         eos="<|endoftext|>",
         **kwargs,
     ) -> dict:
-        """
-        Create the payload for the chat endpoint according to the server's ChatCompletionRequest format.
-        Handles validation and formatting of messages and parameters.
-        """
+        """Create the payload for the chat endpoint"""
         gen_kwargs = gen_kwargs or {}
         
         # Parse and validate messages
         try:
-            formatted_messages = self._parse_messages(messages)
+            parsed_messages = self._parse_messages(messages)
+            formatted_messages = [self._validate_message(msg) for msg in parsed_messages]
         except Exception as e:
-            raise ValueError(f"Failed to parse messages: {e}")
+            raise ValueError(f"Message processing failed: {e}")
 
-        # Validate each message
-        for msg in formatted_messages:
-            if not isinstance(msg, dict) or 'role' not in msg or 'content' not in msg:
-                raise ValueError(f"Invalid message format after parsing: {msg}")
-            if msg['role'] not in ['system', 'user', 'assistant']:
-                raise ValueError(f"Invalid role in message: {msg['role']}")
-            msg['content'] = str(msg['content'])
-
-        # Handle max_tokens
-        if "max_tokens" in gen_kwargs:
-            max_tokens = gen_kwargs.pop("max_tokens")
-        else:
-            max_tokens = gen_kwargs.pop("max_gen_toks", self._max_gen_toks)
-
-        # Handle temperature and other parameters
+        # Handle parameters
+        max_tokens = gen_kwargs.pop("max_tokens", None) or gen_kwargs.pop("max_gen_toks", self._max_gen_toks)
         temperature = gen_kwargs.pop("temperature", 0)
         
-        # Format stop sequences
+        # Handle stop sequences
         stop = handle_stop_sequences(gen_kwargs.pop("until", [eos]), eos)
         if not isinstance(stop, (list, tuple)):
             stop = [stop]
-        
-        # Create the request payload according to server's expected format
+
+        # Create base payload
         payload = {
             "model": self.model,
             "messages": formatted_messages,
-            "temperature": float(temperature),  # Ensure temperature is float
-            "max_tokens": int(max_tokens),      # Ensure max_tokens is int
-            "stream": True,                     # Always stream for our implementation
-            "stop": stop[:4]                    # OpenAI API limit
+            "temperature": float(temperature),
+            "max_tokens": int(max_tokens),
+            "stream": True,
+            "stop": stop[:4]
         }
 
-        # Add any additional supported parameters from gen_kwargs
+        # Add additional parameters
         supported_params = {
             "top_p": float,
             "frequency_penalty": float,
@@ -172,10 +182,7 @@ class EntropixLocalChatModel(TemplateAPI):
         return payload
 
     def _stream_completion(self, payload: dict) -> Dict:
-        """
-        Handle the streaming response from the local endpoint.
-        Includes proper error handling for validation errors and malformed responses.
-        """
+        """Handle streaming response from the endpoint"""
         try:
             with requests.post(
                 self._base_url,
@@ -202,7 +209,6 @@ class EntropixLocalChatModel(TemplateAPI):
                     except json.JSONDecodeError:
                         continue
 
-                    # Process choices in the response
                     if "choices" in data and data["choices"]:
                         for choice in data["choices"]:
                             delta = choice.get("delta", {})
@@ -220,7 +226,6 @@ class EntropixLocalChatModel(TemplateAPI):
                                     }]
                                 }
                 
-                # Return accumulated response if stream ends without explicit stop
                 return {
                     "choices": [{
                         "message": {
@@ -231,7 +236,7 @@ class EntropixLocalChatModel(TemplateAPI):
                 }
 
         except RequestException as e:
-            if e.response is not None:
+            if hasattr(e, 'response'):
                 if e.response.status_code == 422:
                     error_detail = e.response.json().get('detail', 'Unknown validation error')
                     raise ValueError(f"Request validation failed: {error_detail}")
@@ -239,14 +244,13 @@ class EntropixLocalChatModel(TemplateAPI):
                     raise ValueError("Model not initialized or unavailable")
             raise ValueError(f"Error contacting local model: {e}")
 
-    def model_call(self, **kwargs):
-        """Handle calls from lm_eval that provide `messages` and `gen_kwargs`"""
+    def model_call(self, **kwargs) -> Dict:
+        """Handle calls from lm_eval"""
         messages = kwargs.pop("messages", None)
-        gen_kwargs = kwargs.pop("gen_kwargs", {})
-    
         if messages is None:
             raise ValueError("No messages provided to model_call")
-    
+        
+        gen_kwargs = kwargs.pop("gen_kwargs", {})
         payload = self._create_payload(
             messages=messages,
             generate=True,
@@ -263,13 +267,11 @@ class EntropixLocalChatModel(TemplateAPI):
         **kwargs,
     ) -> List[Tuple[float, bool]]:
         """Chat completions do not support token-level logprobs"""
-        raise NotImplementedError(
-            "Loglikelihood is not supported for chat completions."
-        )
+        raise NotImplementedError("Loglikelihood not supported for chat completions")
 
     @staticmethod
     def parse_generations(outputs: Union[Dict, List[Dict]], **kwargs) -> List[str]:
-        """Parse the generated assistant message from the final returned dict"""
+        """Parse the generated assistant message"""
         if not isinstance(outputs, list):
             outputs = [outputs]
         res = []
@@ -280,18 +282,10 @@ class EntropixLocalChatModel(TemplateAPI):
                 res.append(content)
         return res
 
-    def tok_encode(
-        self,
-        string: Union[str, Any],
-        left_truncate_len=None,
-        add_special_tokens=None,
-        **kwargs,
-    ) -> Union[List[str], List[int], Any]:
+    def tok_encode(self, string: Union[str, Any], **kwargs) -> Union[List[str], List[int], Any]:
         """Return input as-is for chat models"""
         return string
 
     def loglikelihood(self, requests, **kwargs):
         """Chat completions do not support loglikelihood computation"""
-        raise NotImplementedError(
-            "Loglikelihood is not supported for chat completions."
-        )
+        raise NotImplementedError("Loglikelihood not supported for chat completions")
