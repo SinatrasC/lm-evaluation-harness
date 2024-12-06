@@ -84,40 +84,65 @@ class EntropixLocalChatModel(TemplateAPI):
         **kwargs,
     ) -> dict:
         """
-        Create the payload for the chat endpoint. We assume --apply_chat_template 
-        has already formatted the `messages` as a list of dicts like:
-        [{"role": "system", "content": ...}, {"role": "user", "content": ...}, ...]
+        Create the payload for the chat endpoint according to the server's ChatCompletionRequest format.
+        Handles validation and formatting of messages and parameters.
         """
         gen_kwargs = gen_kwargs or {}
-        gen_kwargs.pop("do_sample", False)
         
-        # max_tokens logic
+        # Validate and format messages
+        formatted_messages = []
+        for msg in messages:
+            if not isinstance(msg, dict) or 'role' not in msg or 'content' not in msg:
+                raise ValueError(f"Invalid message format: {msg}")
+            if msg['role'] not in ['system', 'user', 'assistant']:
+                raise ValueError(f"Invalid role in message: {msg['role']}")
+            formatted_messages.append({
+                "role": msg['role'],
+                "content": str(msg['content'])
+            })
+
+        # Handle max_tokens
         if "max_tokens" in gen_kwargs:
             max_tokens = gen_kwargs.pop("max_tokens")
         else:
             max_tokens = gen_kwargs.pop("max_gen_toks", self._max_gen_toks)
 
+        # Handle temperature and other parameters
         temperature = gen_kwargs.pop("temperature", 0)
+        
+        # Format stop sequences
         stop = handle_stop_sequences(gen_kwargs.pop("until", [eos]), eos)
         if not isinstance(stop, (list, tuple)):
             stop = [stop]
-
+        
+        # Create the request payload according to server's expected format
         payload = {
-            "messages": messages,
             "model": self.model,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stop": stop[:4],  # OpenAI API limit
+            "messages": formatted_messages,
+            "temperature": float(temperature),  # Ensure temperature is float
+            "max_tokens": int(max_tokens),      # Ensure max_tokens is int
+            "stream": True,                     # Always stream for our implementation
+            "stop": stop[:4]                    # OpenAI API limit
         }
-        # Add any remaining gen_kwargs to payload
-        payload.update(gen_kwargs)
+
+        # Add any additional supported parameters from gen_kwargs
+        supported_params = {
+            "top_p": float,
+            "frequency_penalty": float,
+            "presence_penalty": float,
+            "seed": int
+        }
+        
+        for param, type_conv in supported_params.items():
+            if param in gen_kwargs:
+                payload[param] = type_conv(gen_kwargs[param])
+        
         return payload
 
     def _stream_completion(self, payload: dict) -> Dict:
         """
         Handle the streaming response from the local endpoint.
-        The endpoint returns `text/event-stream`, with lines like:
-        data: {"id":"...", "choices":[{"delta":{"content":"..."},"finish_reason":null}]}
+        Includes proper error handling for validation errors and malformed responses.
         """
         try:
             with requests.post(
@@ -174,6 +199,12 @@ class EntropixLocalChatModel(TemplateAPI):
                 }
 
         except RequestException as e:
+            if e.response is not None:
+                if e.response.status_code == 422:
+                    error_detail = e.response.json().get('detail', 'Unknown validation error')
+                    raise ValueError(f"Request validation failed: {error_detail}")
+                elif e.response.status_code == 503:
+                    raise ValueError("Model not initialized or unavailable")
             raise ValueError(f"Error contacting local model: {e}")
 
     def model_call(self, **kwargs):
